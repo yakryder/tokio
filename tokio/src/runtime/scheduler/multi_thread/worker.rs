@@ -57,6 +57,7 @@
 //! leak.
 
 use crate::loom::sync::{Arc, Mutex};
+use std::sync::Weak;
 use crate::runtime;
 use crate::runtime::scheduler::multi_thread::{
     idle, queue, Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, Unparker,
@@ -142,8 +143,13 @@ struct Core {
     rand: FastRand,
 
     /// Per-worker timers: lock-free HashMap for timer registration
-    /// Maps deadline -> wakers to fire at that time
-    timers: HashMap<Instant, Vec<Waker>>,
+    /// Maps deadline -> weak waker references. Using Weak allows timers
+    /// that are dropped before firing to be automatically cleaned up.
+    timers: HashMap<Instant, Vec<Weak<Waker>>>,
+
+    /// Tracks the earliest timer deadline to avoid scanning the HashMap
+    /// when no timers have expired yet
+    next_deadline: Option<Instant>,
 }
 
 /// State shared across all workers
@@ -273,6 +279,7 @@ pub(super) fn create(
             stats,
             rand: FastRand::from_seed(config.seed_generator.next_seed()),
             timers: HashMap::new(),
+            next_deadline: None,
         }));
 
         remotes.push(Remote { steal, unpark });
@@ -806,15 +813,11 @@ impl Context {
     /// Register a timer with the current worker's local timer HashMap.
     ///
     /// This is called from TimerEntry when a timer needs to be registered.
-    /// Returns true if successfully registered, false if no core is available
-    /// (e.g., during block_in_place).
-    pub(crate) fn register_timer(&self, deadline: Instant, waker: Waker) -> bool {
+    /// Registers the weak waker reference with the worker's timer map.
+    pub(crate) fn register_timer(&self, deadline: Instant, waker: Weak<Waker>) {
         let mut core = self.core.borrow_mut();
         if let Some(core) = core.as_mut() {
             core.register_timer(deadline, waker);
-            true
-        } else {
-            false
         }
     }
 }
@@ -1073,24 +1076,46 @@ impl Core {
     /// deadlines have passed. Unlike the global timer wheel, this is lock-free
     /// and doesn't require any synchronization.
     fn fire_expired_timers(&mut self, now: Instant) {
+        // Early exit if no timers have expired yet
+        if self.next_deadline.is_some_and(|deadline| now < deadline) {
+            return;
+        }
+
+        // Fire expired timers and track the new minimum deadline
+        let mut new_min: Option<Instant> = None;
         self.timers.retain(|&deadline, wakers| {
-            (now < deadline) || {
-                wakers.drain(..).for_each(Waker::wake);
-                false
+            match now < deadline {
+                true => {
+                    new_min = Some(new_min.map_or(deadline, |current| current.min(deadline)));
+                    true
+                }
+                false => {
+                    // Expired - fire and remove, skipping wakers that have been dropped
+                    wakers.drain(..)
+                        .filter_map(|weak| weak.upgrade())
+                        .for_each(|waker| waker.wake_by_ref());
+                    false
+                }
             }
         });
+
+        self.next_deadline = new_min;
     }
 
     /// Register a timer waker at the given deadline.
     ///
     /// This is called from TimerEntry::poll_elapsed when a timer is registered.
     /// The waker will be fired when fire_expired_timers() is called with a time
-    /// >= deadline.
-    pub(crate) fn register_timer(&mut self, deadline: Instant, waker: Waker) {
+    /// >= deadline. Accepts a Weak reference so dropped timers can be automatically
+    /// cleaned up.
+    pub(crate) fn register_timer(&mut self, deadline: Instant, waker: Weak<Waker>) {
         self.timers
             .entry(deadline)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(waker);
+
+        // Update next_deadline if this is the earliest timer
+        self.next_deadline = Some(self.next_deadline.map_or(deadline, |current| current.min(deadline)));
     }
 }
 

@@ -191,13 +191,27 @@ cfg_rt! {
     }
 
     /// Attempts to register a timer with the current worker's local timer map.
-    /// Returns true if registered, false if no multi-threaded worker core available.
+    /// Returns the Arc<Waker> if registered (caller must hold this to keep timer alive),
+    /// or None if no multi-threaded worker core available.
     #[cfg(all(feature = "rt", feature = "rt-multi-thread"))]
-    pub(crate) fn try_register_timer(deadline: crate::time::Instant, waker: std::task::Waker) -> bool {
-        with_scheduler(|ctx| match ctx {
-            Some(scheduler::Context::MultiThread(ctx)) => ctx.register_timer(deadline.into(), waker),
+    pub(crate) fn try_register_timer(
+        deadline: crate::time::Instant,
+        waker: std::task::Waker,
+    ) -> Option<std::sync::Arc<std::task::Waker>> {
+        use std::sync::Arc;
+
+        let waker_arc = Arc::new(waker);
+        let waker_weak = Arc::downgrade(&waker_arc);
+
+        let registered = with_scheduler(|ctx| match ctx {
+            Some(scheduler::Context::MultiThread(ctx)) => {
+                ctx.register_timer(deadline.into(), waker_weak);
+                true
+            }
             _ => false,
-        })
+        });
+
+        registered.then_some(waker_arc)
     }
 
     cfg_taskdump! {

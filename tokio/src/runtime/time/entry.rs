@@ -300,6 +300,9 @@ pin_project! {
         deadline: Instant,
         // Whether the deadline has been registered.
         registered: bool,
+        // For per-worker timers: holds the Arc<Waker> to keep the timer alive.
+        // When this is dropped, the Weak reference in the worker's HashMap becomes invalid.
+        per_worker_waker: Option<std::sync::Arc<Waker>>,
     }
 
     impl PinnedDrop for TimerEntry {
@@ -488,6 +491,7 @@ impl TimerEntry {
             inner: None,
             deadline,
             registered: false,
+            per_worker_waker: None,
         }
     }
 
@@ -609,10 +613,13 @@ impl TimerEntry {
             #[cfg(feature = "rt-multi-thread")]
             {
                 // Try worker-local registration first (lock-free on multi-threaded runtime)
-                if crate::runtime::context::try_register_timer(self.deadline, cx.waker().clone()) {
+                if let Some(waker_arc) =
+                    crate::runtime::context::try_register_timer(self.deadline, cx.waker().clone())
+                {
                     // Successfully registered with worker-local timers
                     let this = self.as_mut().project();
                     *this.registered = true;
+                    *this.per_worker_waker = Some(waker_arc);
                     return Poll::Pending;
                 }
             }
