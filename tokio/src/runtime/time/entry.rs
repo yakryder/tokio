@@ -705,9 +705,20 @@ impl TimerHandle {
         self.inner.as_ref().mark_in_buckets()
     }
 
+    /// Unmarks this timer as being in the buckets.
+    pub(super) unsafe fn unmark_in_buckets(&self) {
+        self.inner.as_ref().in_buckets.store(false, crate::loom::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Returns true if this timer is in the buckets (vs the wheel).
     pub(super) fn is_in_buckets(&self) -> bool {
         unsafe { self.inner.as_ref().is_in_buckets() }
+    }
+
+    /// Compares two timer handles for pointer equality.
+    /// Used to identify matching timers in bucket removal.
+    pub(super) fn ptr_eq(&self, other: &TimerHandle) -> bool {
+        std::ptr::eq(self.inner.as_ptr() as *const _, other.inner.as_ptr() as *const _)
     }
 
     /// Attempts to transition to a terminal state. If the state is already a

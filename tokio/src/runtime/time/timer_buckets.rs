@@ -139,6 +139,33 @@ impl GlobalTimerBuckets {
         InsertResult::Inserted
     }
 
+    /// Removes a timer from the buckets using its expiration tick.
+    ///
+    /// This is called during timer reset to remove a timer from its old bucket
+    /// before reinserting it into a new bucket.
+    ///
+    /// # Parameters
+    /// - `expiration_tick`: The expiration tick the timer was inserted with
+    /// - `timer`: The timer handle to remove
+    pub(crate) fn remove_from_buckets(&self, expiration_tick: u64, timer: TimerHandle) {
+        let ref_tick = self.ref_time.load(Ordering::Acquire);
+        let head_pos = self.head.load(Ordering::Acquire);
+
+        // Check if the timer's expiration is within our range
+        let offset = expiration_tick.saturating_sub(ref_tick);
+        if offset >= BUCKET_COUNT as u64 {
+            // Timer was not in buckets (must be in wheel or not registered)
+            return;
+        }
+
+        // Calculate which bucket it should be in
+        let bucket_idx = (head_pos + offset as usize) % BUCKET_COUNT;
+
+        // Lock just this bucket and remove the timer
+        let mut bucket = self.buckets[bucket_idx].timers.lock();
+        bucket.retain(|h| !h.ptr_eq(&timer));
+    }
+
     /// Advances the ring buffer to the current time and fires all expired timers.
     ///
     /// This is called by the driver when it processes timers. Returns all wakers
