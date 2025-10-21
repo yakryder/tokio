@@ -392,15 +392,11 @@ impl Handle {
 
             match self.inner.buckets.try_insert(new_tick, entry_handle) {
                 timer_buckets::InsertResult::Inserted => {
-                    // Only unpark if this timer is earlier than current next_wake
-                    let lock = self.inner.lock();
-                    if lock
-                        .next_wake
-                        .map(|next_wake| new_tick < next_wake.get())
-                        .unwrap_or(true)
-                    {
-                        unpark.unpark();
-                    }
+                    // Always unpark for bucket insertions - the bucket maintains its own
+                    // next_wake atomic, and we need to ensure the driver wakes up for
+                    // bucket timers. Checking next_wake would require locking, defeating
+                    // the purpose of lock-free bucket insertion.
+                    unpark.unpark();
                     return;
                 }
                 timer_buckets::InsertResult::Elapsed(handle) => {
@@ -428,15 +424,11 @@ impl Handle {
                     // If timer was previously in wheel, it will remain there as a stale entry
                     // The wheel will skip it when it sees in_buckets = true
 
-                    // Only unpark if this timer is earlier than current next_wake
-                    let lock = self.inner.lock();
-                    if lock
-                        .next_wake
-                        .map(|next_wake| new_tick < next_wake.get())
-                        .unwrap_or(true)
-                    {
-                        unpark.unpark();
-                    }
+                    // Always unpark for bucket insertions - the bucket maintains its own
+                    // next_wake atomic, and we need to ensure the driver wakes up for
+                    // bucket timers. Checking next_wake would require locking, defeating
+                    // the purpose of lock-free bucket insertion.
+                    unpark.unpark();
                     return;
                 }
                 timer_buckets::InsertResult::Elapsed(handle) => {
