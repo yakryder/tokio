@@ -232,6 +232,9 @@ impl GlobalTimerBuckets {
         // to fire all buckets once, not loop billions of times
         let ticks_to_advance = std::cmp::min(ticks_elapsed, BUCKET_COUNT as u64);
 
+        // Track if we need to clear next_wake (if we fire the bucket it points to and it becomes empty)
+        let current_next_wake = self.next_wake.load(Ordering::Acquire);
+
         // Advance through each elapsed tick, firing timers in each bucket
         for _ in 0..ticks_to_advance {
             // Atomically advance head and ref_time, get the tick we're firing
@@ -241,6 +244,8 @@ impl GlobalTimerBuckets {
 
             // Fire all timers in this bucket
             let mut bucket = self.buckets[bucket_idx].timers.lock();
+
+            let had_timers = !bucket.is_empty();
 
             for timer_handle in bucket.drain(..) {
                 // Skip stale copies that were moved to the wheel.
@@ -262,24 +267,19 @@ impl GlobalTimerBuckets {
                     wakers.push(waker);
                 }
             }
-        }
 
-        // Recalculate next_wake by scanning for the next non-empty bucket
-        let current_ref_tick = self.ref_time.load(Ordering::Acquire);
-        let current_head = self.head.load(Ordering::Acquire);
-        let mut new_next_wake = u64::MAX;
-
-        for offset in 0..BUCKET_COUNT {
-            let bucket_idx = (current_head + offset) % BUCKET_COUNT;
-            let bucket = self.buckets[bucket_idx].timers.lock();
-
-            if !bucket.is_empty() {
-                new_next_wake = current_ref_tick + offset as u64;
-                break;
+            // If we just drained the bucket that next_wake was pointing to, clear it
+            if had_timers && current_tick == current_next_wake {
+                // Use compare_exchange to only clear if it's still pointing to this tick
+                // (another thread might have inserted a new earlier timer)
+                let _ = self.next_wake.compare_exchange(
+                    current_next_wake,
+                    u64::MAX,
+                    Ordering::Release,
+                    Ordering::Relaxed
+                );
             }
         }
-
-        self.next_wake.store(new_next_wake, Ordering::Release);
 
         wakers
     }
