@@ -184,7 +184,18 @@ impl Driver {
 
         assert!(!handle.is_shutdown());
 
-        let next_wake = lock.wheel.next_expiration_time();
+        // Calculate next_wake from both bucket timers and wheel timers
+        let bucket_next = handle.inner.buckets.next_expiration_time();
+        let wheel_next = lock.wheel.next_expiration_time();
+
+        // Take the minimum of bucket and wheel next expiration times
+        let next_wake = match (bucket_next, wheel_next) {
+            (Some(b), Some(w)) => Some(std::cmp::min(b, w)),
+            (Some(b), None) => Some(b),
+            (None, Some(w)) => Some(w),
+            (None, None) => None,
+        };
+
         lock.next_wake =
             next_wake.map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
 
@@ -307,10 +318,20 @@ impl Handle {
             }
         }
 
-        lock.next_wake = lock
-            .wheel
-            .poll_at()
-            .map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
+        // Calculate next_wake from both bucket timers and wheel timers
+        let bucket_next = self.inner.buckets.next_expiration_time();
+        let wheel_next = lock.wheel.poll_at();
+
+        // Take the minimum of bucket and wheel next expiration times
+        let next_wake = match (bucket_next, wheel_next) {
+            (Some(b), Some(w)) => Some(std::cmp::min(b, w)),
+            (Some(b), None) => Some(b),
+            (None, Some(w)) => Some(w),
+            (None, None) => None,
+        };
+
+        lock.next_wake =
+            next_wake.map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
 
         drop(lock);
 
@@ -371,7 +392,15 @@ impl Handle {
 
             match self.inner.buckets.try_insert(new_tick, entry_handle) {
                 timer_buckets::InsertResult::Inserted => {
-                    unpark.unpark();
+                    // Only unpark if this timer is earlier than current next_wake
+                    let lock = self.inner.lock();
+                    if lock
+                        .next_wake
+                        .map(|next_wake| new_tick < next_wake.get())
+                        .unwrap_or(true)
+                    {
+                        unpark.unpark();
+                    }
                     return;
                 }
                 timer_buckets::InsertResult::Elapsed(handle) => {
@@ -398,7 +427,16 @@ impl Handle {
                     // Successfully inserted in buckets
                     // If timer was previously in wheel, it will remain there as a stale entry
                     // The wheel will skip it when it sees in_buckets = true
-                    unpark.unpark();
+
+                    // Only unpark if this timer is earlier than current next_wake
+                    let lock = self.inner.lock();
+                    if lock
+                        .next_wake
+                        .map(|next_wake| new_tick < next_wake.get())
+                        .unwrap_or(true)
+                    {
+                        unpark.unpark();
+                    }
                     return;
                 }
                 timer_buckets::InsertResult::Elapsed(handle) => {

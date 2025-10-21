@@ -610,11 +610,15 @@ impl TimerEntry {
         // is physically located in a specific bucket. Changing the expiration would
         // leave the handle in the wrong bucket. So we skip extend_expiration and go
         // straight to reregister, which will insert into the correct new bucket.
+        //
+        // NOTE: Even when reregister=false (e.g., reset_without_reregister used by Interval),
+        // bucket timers MUST still reregister to move the handle to the new bucket.
+        // The reregister=false case is only valid for wheel timers which can use extend_expiration.
         if !inner.is_in_buckets() && inner.extend_expiration(tick).is_ok() {
             return;
         }
 
-        if reregister {
+        if reregister || inner.is_in_buckets() {
             unsafe {
                 self.driver()
                     .reregister(&self.driver.driver().io, tick, inner.into());

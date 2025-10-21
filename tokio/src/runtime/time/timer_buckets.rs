@@ -48,6 +48,11 @@ pub(crate) struct GlobalTimerBuckets {
     /// The tick value (milliseconds since epoch) that the head position represents.
     /// Used to calculate bucket offsets for new timers.
     ref_time: AtomicU64,
+
+    /// The earliest timer deadline across all buckets.
+    /// Used to calculate when the driver should wake up.
+    /// Value of u64::MAX means no timers are registered.
+    next_wake: AtomicU64,
 }
 
 /// A single bucket in the ring buffer.
@@ -90,6 +95,7 @@ impl GlobalTimerBuckets {
             buckets,
             head: AtomicUsize::new(0),
             ref_time: AtomicU64::new(initial_tick),
+            next_wake: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -102,11 +108,6 @@ impl GlobalTimerBuckets {
     /// - `timer`: The timer handle to insert
     pub(crate) fn try_insert(&self, deadline_tick: u64, timer: TimerHandle) -> InsertResult {
         self.try_insert_inner(deadline_tick, timer, true)
-    }
-
-    /// Inserts without calling mark_in_buckets (for resets where flag is already set)
-    pub(crate) fn try_insert_no_mark(&self, deadline_tick: u64, timer: TimerHandle) -> InsertResult {
-        self.try_insert_inner(deadline_tick, timer, false)
     }
 
     fn try_insert_inner(&self, deadline_tick: u64, timer: TimerHandle, mark: bool) -> InsertResult {
@@ -154,6 +155,9 @@ impl GlobalTimerBuckets {
 
         bucket.push(timer);
 
+        // Update next_wake if this timer is earlier
+        self.next_wake.fetch_min(deadline_tick, Ordering::Release);
+
         InsertResult::Inserted
     }
 
@@ -185,6 +189,26 @@ impl GlobalTimerBuckets {
 
         // Remove the matching timer handle (by pointer equality)
         bucket.retain(|h| !h.ptr_eq(timer));
+    }
+
+    /// Advances the ring buffer to the current time and fires all expired timers.
+    ///
+    /// This is called by the driver when it processes timers. Returns all wakers
+    /// that need to be woken after the driver lock is released.
+    ///
+    /// # Parameters
+    /// - `now_tick`: The current tick (milliseconds since epoch)
+    ///
+    /// Returns the tick of the next timer that will fire, if any.
+    ///
+    /// This is used to calculate when the driver should wake up.
+    pub(crate) fn next_expiration_time(&self) -> Option<u64> {
+        let next = self.next_wake.load(Ordering::Acquire);
+        if next == u64::MAX {
+            None
+        } else {
+            Some(next)
+        }
     }
 
     /// Advances the ring buffer to the current time and fires all expired timers.
@@ -239,6 +263,23 @@ impl GlobalTimerBuckets {
                 }
             }
         }
+
+        // Recalculate next_wake by scanning for the next non-empty bucket
+        let current_ref_tick = self.ref_time.load(Ordering::Acquire);
+        let current_head = self.head.load(Ordering::Acquire);
+        let mut new_next_wake = u64::MAX;
+
+        for offset in 0..BUCKET_COUNT {
+            let bucket_idx = (current_head + offset) % BUCKET_COUNT;
+            let bucket = self.buckets[bucket_idx].timers.lock();
+
+            if !bucket.is_empty() {
+                new_next_wake = current_ref_tick + offset as u64;
+                break;
+            }
+        }
+
+        self.next_wake.store(new_next_wake, Ordering::Release);
 
         wakers
     }
