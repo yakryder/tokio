@@ -132,6 +132,7 @@ impl GlobalTimerBuckets {
         unsafe {
             timer.mark_in_buckets();
             timer.set_expiration(deadline_tick);
+            timer.set_bucket_index(bucket_idx);
         }
 
         bucket.push(timer);
@@ -139,29 +140,18 @@ impl GlobalTimerBuckets {
         InsertResult::Inserted
     }
 
-    /// Removes a timer from the buckets using its expiration tick.
+    /// Removes a timer from the buckets using its stored bucket index.
     ///
     /// This is called during timer reset to remove a timer from its old bucket
     /// before reinserting it into a new bucket.
     ///
     /// # Parameters
-    /// - `expiration_tick`: The expiration tick the timer was inserted with
-    /// - `timer`: The timer handle to remove
-    pub(crate) fn remove_from_buckets(&self, expiration_tick: u64, timer: TimerHandle) {
-        let ref_tick = self.ref_time.load(Ordering::Acquire);
-        let head_pos = self.head.load(Ordering::Acquire);
+    /// - `timer`: The timer handle to remove (must have bucket_index set)
+    pub(crate) fn remove_from_buckets(&self, timer: TimerHandle) {
+        let bucket_idx = unsafe { timer.get_bucket_index() };
 
-        // Check if the timer's expiration is within our range
-        let offset = expiration_tick.saturating_sub(ref_tick);
-        if offset >= BUCKET_COUNT as u64 {
-            // Timer was not in buckets (must be in wheel or not registered)
-            return;
-        }
-
-        // Calculate which bucket it should be in
-        let bucket_idx = (head_pos + offset as usize) % BUCKET_COUNT;
-
-        // Lock just this bucket and remove the timer
+        // bucket_idx is the actual index in the pre-allocated buckets Vec, which never moves.
+        // Remove the timer from this bucket.
         let mut bucket = self.buckets[bucket_idx].timers.lock();
         bucket.retain(|h| !h.ptr_eq(&timer));
     }

@@ -361,20 +361,18 @@ impl Handle {
         new_tick: u64,
         entry: NonNull<TimerShared>,
     ) {
-        // NOTE: We don't attempt to remove the old timer from its bucket because
-        // the bucket ring is constantly rotating. The bucket index calculation would be
-        // complex and error-prone. Instead, we accept that stale copies may exist in buckets.
-        // The fire() logic handles this: the first copy fires (transitions state), the second is silent.
-        // We just need to make sure the in_buckets flag is updated correctly for cleanup.
+        // If timer was previously in buckets, remove it from its old bucket first.
+        // We stored the bucket index, so removal is direct.
+        if unsafe { entry.as_ref().is_in_buckets() } && unsafe { entry.as_ref().might_be_registered() } {
+            self.inner.buckets.remove_from_buckets(entry.as_ref().handle());
+        }
 
         // Try to insert into buckets first (fast path for timers < 120s)
-        // Note: try_insert will call set_expiration under the bucket lock
         let entry_handle = entry.as_ref().handle();
 
         match self.inner.buckets.try_insert(new_tick, entry_handle) {
             timer_buckets::InsertResult::Inserted => {
                 // Successfully inserted into buckets (set_expiration already called)
-                // Unpark driver to process it
                 unpark.unpark();
                 return;
             }
@@ -384,10 +382,8 @@ impl Handle {
                 return;
             }
             timer_buckets::InsertResult::OutOfRange(_handle) => {
-                // Timer didn't fit in buckets, unmark it since it's going to the wheel instead
+                // Timer didn't fit in buckets, unmark and fall through to wheel
                 unsafe { entry.as_ref().handle().unmark_in_buckets() };
-                // Fall through to wheel path below
-                // We can't use the handle from buckets, need to recreate it from entry
             }
         }
 
