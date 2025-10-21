@@ -361,38 +361,65 @@ impl Handle {
         new_tick: u64,
         entry: NonNull<TimerShared>,
     ) {
-        // If timer was previously in buckets, remove it from its old bucket first.
-        // We stored the bucket index, so removal is direct.
-        if unsafe { entry.as_ref().is_in_buckets() } && unsafe { entry.as_ref().might_be_registered() } {
-            self.inner.buckets.remove_from_buckets(entry.as_ref().handle());
+        // Check if this timer was previously in buckets
+        let was_in_buckets = unsafe { entry.as_ref().is_in_buckets() };
+
+        if was_in_buckets {
+            // Timer is in buckets - keep it in buckets for reset
+            // Just insert at new deadline - stale copies will be skipped via registered_when check
+            let entry_handle = entry.as_ref().handle();
+
+            match self.inner.buckets.try_insert(new_tick, entry_handle) {
+                timer_buckets::InsertResult::Inserted => {
+                    unpark.unpark();
+                    return;
+                }
+                timer_buckets::InsertResult::Elapsed(handle) => {
+                    // Timer already elapsed - but update registered_when so future resets work
+                    unsafe {
+                        entry.as_ref().set_registered_when(new_tick);
+                        handle.fire(Ok(()));
+                    };
+                    return;
+                }
+                timer_buckets::InsertResult::OutOfRange(_handle) => {
+                    // New deadline is >120s, must move to wheel
+                    unsafe { entry.as_ref().handle().unmark_in_buckets() };
+                    // Fall through to wheel path below
+                }
+            }
+        } else {
+            // Timer was NOT in buckets (either new or was in wheel)
+            // Try buckets first for the new deadline
+            let entry_handle = entry.as_ref().handle();
+
+            match self.inner.buckets.try_insert(new_tick, entry_handle) {
+                timer_buckets::InsertResult::Inserted => {
+                    // Successfully inserted in buckets
+                    // If timer was previously in wheel, it will remain there as a stale entry
+                    // The wheel will skip it when it sees in_buckets = true
+                    unpark.unpark();
+                    return;
+                }
+                timer_buckets::InsertResult::Elapsed(handle) => {
+                    // Timer already elapsed - but update registered_when so future resets work
+                    unsafe {
+                        entry.as_ref().set_registered_when(new_tick);
+                        handle.fire(Ok(()));
+                    };
+                    return;
+                }
+                timer_buckets::InsertResult::OutOfRange(_handle) => {
+                    // Fall through to wheel path
+                }
+            }
         }
 
-        // Try to insert into buckets first (fast path for timers < 120s)
-        let entry_handle = entry.as_ref().handle();
-
-        match self.inner.buckets.try_insert(new_tick, entry_handle) {
-            timer_buckets::InsertResult::Inserted => {
-                // Successfully inserted into buckets (set_expiration already called)
-                unpark.unpark();
-                return;
-            }
-            timer_buckets::InsertResult::Elapsed(handle) => {
-                // Timer has already elapsed, fire it immediately
-                unsafe { handle.fire(Ok(())) };
-                return;
-            }
-            timer_buckets::InsertResult::OutOfRange(_handle) => {
-                // Timer didn't fit in buckets, unmark and fall through to wheel
-                unsafe { entry.as_ref().handle().unmark_in_buckets() };
-            }
-        }
-
-        // Timer didn't fit in buckets (>120s), fall back to timer wheel
+        // Timer didn't fit in buckets (>120s) - use wheel
         let waker = unsafe {
             let mut lock = self.inner.lock();
 
-            // We may have raced with a firing/deregistration, so check before
-            // deregistering.
+            // Remove from wheel if it's already there
             if unsafe { entry.as_ref().might_be_registered() } {
                 lock.wheel.remove(entry);
             }

@@ -101,6 +101,15 @@ impl GlobalTimerBuckets {
     /// - `deadline_tick`: The absolute tick (milliseconds since epoch) when timer expires
     /// - `timer`: The timer handle to insert
     pub(crate) fn try_insert(&self, deadline_tick: u64, timer: TimerHandle) -> InsertResult {
+        self.try_insert_inner(deadline_tick, timer, true)
+    }
+
+    /// Inserts without calling mark_in_buckets (for resets where flag is already set)
+    pub(crate) fn try_insert_no_mark(&self, deadline_tick: u64, timer: TimerHandle) -> InsertResult {
+        self.try_insert_inner(deadline_tick, timer, false)
+    }
+
+    fn try_insert_inner(&self, deadline_tick: u64, timer: TimerHandle, mark: bool) -> InsertResult {
         // Read current reference time and head position atomically
         let ref_tick = self.ref_time.load(Ordering::Acquire);
         let head_pos = self.head.load(Ordering::Acquire);
@@ -124,15 +133,23 @@ impl GlobalTimerBuckets {
         // Lock just this bucket and insert the timer
         let mut bucket = self.buckets[bucket_idx].timers.lock();
 
+        // Re-check after locking - ref_time might have advanced while we were waiting for lock
+        let ref_tick_locked = self.ref_time.load(Ordering::Acquire);
+        if deadline_tick <= ref_tick_locked {
+            // Deadline passed while we were acquiring the lock
+            return InsertResult::Elapsed(timer);
+        }
+
         // SAFETY: We hold the bucket lock which synchronizes with advance().
         // The handle is valid (just passed to us), and this timer is not in
         // the wheel (it's going into buckets instead). The bucket lock provides
         // the necessary memory fence for the relaxed atomic operations in
         // set_expiration() to be visible when advance() later fires this timer.
         unsafe {
-            timer.mark_in_buckets();
+            if mark {
+                timer.mark_in_buckets();
+            }
             timer.set_expiration(deadline_tick);
-            timer.set_bucket_index(bucket_idx);
         }
 
         bucket.push(timer);
@@ -140,20 +157,34 @@ impl GlobalTimerBuckets {
         InsertResult::Inserted
     }
 
-    /// Removes a timer from the buckets using its stored bucket index.
+    /// Removes a specific timer from its bucket.
     ///
-    /// This is called during timer reset to remove a timer from its old bucket
-    /// before reinserting it into a new bucket.
+    /// This is used during reset to remove the old copy before inserting at new deadline.
     ///
     /// # Parameters
-    /// - `timer`: The timer handle to remove (must have bucket_index set)
-    pub(crate) fn remove_from_buckets(&self, timer: TimerHandle) {
-        let bucket_idx = unsafe { timer.get_bucket_index() };
+    /// - `old_deadline_tick`: The deadline where the timer was previously inserted
+    /// - `timer`: The timer handle to remove (compared by pointer equality)
+    pub(crate) fn remove(&self, old_deadline_tick: u64, timer: &TimerHandle) {
+        let ref_tick = self.ref_time.load(Ordering::Acquire);
+        let head_pos = self.head.load(Ordering::Acquire);
 
-        // bucket_idx is the actual index in the pre-allocated buckets Vec, which never moves.
-        // Remove the timer from this bucket.
+        // If old deadline is already past, the bucket may have already fired/drained
+        if old_deadline_tick <= ref_tick {
+            return; // Already past, nothing to remove
+        }
+
+        let offset = old_deadline_tick - ref_tick;
+
+        // If beyond range, nothing to remove (wasn't in buckets)
+        if offset >= BUCKET_COUNT as u64 {
+            return;
+        }
+
+        let bucket_idx = (head_pos + offset as usize) % BUCKET_COUNT;
         let mut bucket = self.buckets[bucket_idx].timers.lock();
-        bucket.retain(|h| !h.ptr_eq(&timer));
+
+        // Remove the matching timer handle (by pointer equality)
+        bucket.retain(|h| !h.ptr_eq(timer));
     }
 
     /// Advances the ring buffer to the current time and fires all expired timers.
@@ -179,16 +210,31 @@ impl GlobalTimerBuckets {
 
         // Advance through each elapsed tick, firing timers in each bucket
         for _ in 0..ticks_to_advance {
-            // Atomically advance head and ref_time
-            let bucket_idx = self.head.fetch_add(1, Ordering::AcqRel) % BUCKET_COUNT;
-            self.ref_time.fetch_add(1, Ordering::AcqRel);
+            // Atomically advance head and ref_time, get the tick we're firing
+            // fetch_add returns the OLD value, but we want to fire the NEW bucket at the NEW time
+            let bucket_idx = (self.head.fetch_add(1, Ordering::AcqRel) + 1) % BUCKET_COUNT;
+            let current_tick = self.ref_time.fetch_add(1, Ordering::AcqRel) + 1;
 
             // Fire all timers in this bucket
             let mut bucket = self.buckets[bucket_idx].timers.lock();
 
-            for timer in bucket.drain(..) {
+            for timer_handle in bucket.drain(..) {
+                // Skip stale copies that were moved to the wheel.
+                // When a timer is reset, it's unmarked from buckets but the old handle
+                // remains in the bucket Vec. We must not fire these stale copies.
+                if !unsafe { timer_handle.is_in_buckets_unsafe() } {
+                    continue;
+                }
+
+                // Also skip if registered_when doesn't match the current tick
+                // This handles stale copies from resets within buckets
+                let registered = unsafe { timer_handle.registered_when() };
+                if registered != current_tick {
+                    continue;
+                }
+
                 // SAFETY: We hold the driver lock, which is required for firing
-                if let Some(waker) = unsafe { timer.fire(Ok(())) } {
+                if let Some(waker) = unsafe { timer_handle.fire(Ok(())) } {
                     wakers.push(waker);
                 }
             }

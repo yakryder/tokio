@@ -367,11 +367,6 @@ pub(crate) struct TimerShared {
     /// under either the bucket lock or driver lock.
     in_buckets: crate::loom::sync::atomic::AtomicBool,
 
-    /// The bucket array index where this timer was inserted (if in_buckets==true).
-    /// This is the actual index into the pre-allocated buckets Vec, which never moves.
-    /// Only accessed during reset, under exclusive entry access.
-    bucket_index: crate::loom::cell::UnsafeCell<usize>,
-
     _p: PhantomPinned,
 }
 
@@ -405,7 +400,6 @@ impl TimerShared {
             pointers: linked_list::Pointers::new(),
             state: StateCell::default(),
             in_buckets: crate::loom::sync::atomic::AtomicBool::new(false),
-            bucket_index: crate::loom::cell::UnsafeCell::new(0),
             _p: PhantomPinned,
         }
     }
@@ -433,7 +427,7 @@ impl TimerShared {
     ///
     /// SAFETY: Must be called with the driver lock held, and when this entry is
     /// not in any timer wheel lists.
-    unsafe fn set_registered_when(&self, when: u64) {
+    pub(super) unsafe fn set_registered_when(&self, when: u64) {
         self.registered_when.store(when, Ordering::Relaxed);
     }
 
@@ -612,7 +606,11 @@ impl TimerEntry {
             }
         };
 
-        if inner.extend_expiration(tick).is_ok() {
+        // For bucket timers, we cannot use extend_expiration because the timer handle
+        // is physically located in a specific bucket. Changing the expiration would
+        // leave the handle in the wrong bucket. So we skip extend_expiration and go
+        // straight to reregister, which will insert into the correct new bucket.
+        if !inner.is_in_buckets() && inner.extend_expiration(tick).is_ok() {
             return;
         }
 
@@ -717,21 +715,15 @@ impl TimerHandle {
     }
 
     /// Returns true if this timer is in the buckets (vs the wheel).
-    pub(super) fn is_in_buckets(&self) -> bool {
+    /// SAFETY: The handle must be valid.
+    pub(super) unsafe fn is_in_buckets_unsafe(&self) -> bool {
         unsafe { self.inner.as_ref().is_in_buckets() }
     }
 
-    /// Stores the bucket array index where this timer was inserted.
-    /// SAFETY: Must be called while holding the bucket lock during insertion.
-    pub(super) unsafe fn set_bucket_index(&self, idx: usize) {
-        self.inner.as_ref().bucket_index.with_mut(|p| {
-            *p = idx;
-        });
-    }
-
-    /// Gets the stored bucket index (only valid if in_buckets==true).
-    pub(super) unsafe fn get_bucket_index(&self) -> usize {
-        self.inner.as_ref().bucket_index.with(|p| *p)
+    /// Returns true if this timer might still be registered (not yet fired).
+    /// SAFETY: The handle must be valid.
+    pub(super) unsafe fn might_be_registered(&self) -> bool {
+        unsafe { self.inner.as_ref().might_be_registered() }
     }
 
     /// Compares two timer handles for pointer equality.
