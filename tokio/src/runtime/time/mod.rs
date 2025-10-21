@@ -16,6 +16,9 @@ pub(crate) use self::handle::Handle;
 mod source;
 pub(crate) use source::TimeSource;
 
+mod timer_buckets;
+use timer_buckets::GlobalTimerBuckets;
+
 mod wheel;
 
 use crate::loom::sync::atomic::{AtomicBool, Ordering};
@@ -94,6 +97,10 @@ struct Inner {
     // The state is split like this so `Handle` can access `is_shutdown` without locking the mutex
     state: Mutex<InnerState>,
 
+    /// Global timer buckets for fast-path timer registration (0-120 seconds).
+    /// These have their own synchronization and don't need the driver lock.
+    buckets: GlobalTimerBuckets,
+
     /// True if the driver is being shutdown.
     is_shutdown: AtomicBool,
 
@@ -112,7 +119,7 @@ struct InnerState {
     /// The earliest time at which we promise to wake up without unparking.
     next_wake: Option<NonZeroU64>,
 
-    /// Timer wheel.
+    /// Timer wheel (fallback for timers > 120 seconds).
     wheel: wheel::Wheel,
 }
 
@@ -125,6 +132,7 @@ impl Driver {
     /// Specifying the source of time is useful when testing.
     pub(crate) fn new(park: IoStack, clock: &Clock) -> (Driver, Handle) {
         let time_source = TimeSource::new(clock);
+        let initial_tick = time_source.now(clock);
 
         let handle = Handle {
             time_source,
@@ -133,6 +141,7 @@ impl Driver {
                     next_wake: None,
                     wheel: wheel::Wheel::new(),
                 }),
+                buckets: GlobalTimerBuckets::new(initial_tick),
                 is_shutdown: AtomicBool::new(false),
 
                 #[cfg(feature = "test-util")]
@@ -255,6 +264,19 @@ impl Handle {
     pub(self) fn process_at_time(&self, mut now: u64) {
         let mut waker_list = WakeList::new();
 
+        // First, advance the timer buckets and fire all expired timers
+        // This doesn't require the driver lock - buckets have their own synchronization
+        // SAFETY: The buckets manage their own thread safety via atomics and per-bucket locks
+        let bucket_wakers = unsafe { self.inner.buckets.advance(now) };
+        for waker in bucket_wakers {
+            waker_list.push(waker);
+
+            if !waker_list.can_push() {
+                waker_list.wake_all();
+            }
+        }
+
+        // Now process the timer wheel (for timers > 120s) - this DOES need the driver lock
         let mut lock = self.inner.lock();
 
         if now < lock.wheel.elapsed() {
@@ -307,13 +329,23 @@ impl Handle {
     /// `add_entry` must not be called concurrently.
     pub(self) unsafe fn clear_entry(&self, entry: NonNull<TimerShared>) {
         unsafe {
-            let mut lock = self.inner.lock();
+            // Check if this timer is in the buckets or the wheel
+            let in_buckets = entry.as_ref().is_in_buckets();
 
-            if entry.as_ref().might_be_registered() {
-                lock.wheel.remove(entry);
+            if in_buckets {
+                // Timer is in buckets - no need to acquire driver lock for removal
+                // Just fire it to mark as cancelled
+                entry.as_ref().handle().fire(Ok(()));
+            } else {
+                // Timer is in the wheel - need driver lock
+                let mut lock = self.inner.lock();
+
+                if entry.as_ref().might_be_registered() {
+                    lock.wheel.remove(entry);
+                }
+
+                entry.as_ref().handle().fire(Ok(()));
             }
-
-            entry.as_ref().handle().fire(Ok(()));
         }
     }
 
@@ -329,6 +361,29 @@ impl Handle {
         new_tick: u64,
         entry: NonNull<TimerShared>,
     ) {
+        // Try to insert into buckets first (fast path for timers < 120s)
+        // Note: try_insert will call set_expiration under the bucket lock
+        let entry_handle = entry.as_ref().handle();
+
+        match self.inner.buckets.try_insert(new_tick, entry_handle) {
+            timer_buckets::InsertResult::Inserted => {
+                // Successfully inserted into buckets (set_expiration already called)
+                // Unpark driver to process it
+                unpark.unpark();
+                return;
+            }
+            timer_buckets::InsertResult::Elapsed(handle) => {
+                // Timer has already elapsed, fire it immediately
+                unsafe { handle.fire(Ok(())) };
+                return;
+            }
+            timer_buckets::InsertResult::OutOfRange(_handle) => {
+                // Fall through to wheel path below
+                // We can't use the handle from buckets, need to recreate it from entry
+            }
+        }
+
+        // Timer didn't fit in buckets (>120s), fall back to timer wheel
         let waker = unsafe {
             let mut lock = self.inner.lock();
 
@@ -344,7 +399,7 @@ impl Handle {
             if self.is_shutdown() {
                 unsafe { entry.fire(Err(crate::time::error::Error::shutdown())) }
             } else {
-                entry.set_expiration(new_tick);
+                unsafe { entry.set_expiration(new_tick) };
 
                 // Note: We don't have to worry about racing with some other resetting
                 // thread, because add_entry and reregister require exclusive control of

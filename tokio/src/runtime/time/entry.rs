@@ -327,6 +327,11 @@ pub(crate) struct TimerHandle {
     inner: NonNull<TimerShared>,
 }
 
+// SAFETY: TimerHandle is a pointer to TimerShared, which is Send + Sync.
+// The handle can be safely sent across threads.
+unsafe impl Send for TimerHandle {}
+unsafe impl Sync for TimerHandle {}
+
 pub(super) type EntryList = crate::util::linked_list::LinkedList<TimerShared, TimerShared>;
 
 /// The shared state structure of a timer. This structure is shared between the
@@ -355,6 +360,12 @@ pub(crate) struct TimerShared {
     /// the ownership of the driver, and if not, its current state (not
     /// complete, fired, error, etc).
     state: StateCell,
+
+    /// Tracks whether this timer is in the buckets (true) or wheel (false).
+    /// This is used during cleanup to determine where to remove the timer from.
+    /// Accessed with relaxed ordering as it's only modified during registration
+    /// under either the bucket lock or driver lock.
+    in_buckets: crate::loom::sync::atomic::AtomicBool,
 
     _p: PhantomPinned,
 }
@@ -388,6 +399,7 @@ impl TimerShared {
             registered_when: AtomicU64::new(0),
             pointers: linked_list::Pointers::new(),
             state: StateCell::default(),
+            in_buckets: crate::loom::sync::atomic::AtomicBool::new(false),
             _p: PhantomPinned,
         }
     }
@@ -452,6 +464,17 @@ impl TimerShared {
     /// definitely _not_ registered.
     pub(super) fn might_be_registered(&self) -> bool {
         self.state.might_be_registered()
+    }
+
+    /// Returns true if this timer is registered in the buckets (vs the wheel).
+    pub(super) fn is_in_buckets(&self) -> bool {
+        self.in_buckets.load(Ordering::Relaxed)
+    }
+
+    /// Marks this timer as being in the buckets.
+    /// SAFETY: Must be called while holding the bucket lock during insertion.
+    pub(super) unsafe fn mark_in_buckets(&self) {
+        self.in_buckets.store(true, Ordering::Relaxed);
     }
 }
 
@@ -641,8 +664,14 @@ impl TimerHandle {
 
     /// Forcibly sets the true and cached expiration times to the given tick.
     ///
-    /// SAFETY: The caller must ensure that the handle remains valid, the driver
-    /// lock is held, and that the timer is not in any wheel linked lists.
+    /// SAFETY: The caller must ensure that the handle remains valid and that
+    /// the timer is not in any wheel linked lists. Additionally, either:
+    /// - The driver lock is held (for wheel-based timers), OR
+    /// - The appropriate bucket lock is held (for bucket-based timers)
+    ///
+    /// The lock requirement ensures proper memory synchronization between the
+    /// thread setting the expiration and the driver thread that will later
+    /// fire the timer.
     pub(super) unsafe fn set_expiration(&self, tick: u64) {
         self.inner.as_ref().set_expiration(tick);
     }
@@ -668,6 +697,17 @@ impl TimerHandle {
                 Err(tick)
             }
         }
+    }
+
+    /// Marks this timer as being in the buckets.
+    /// SAFETY: Must be called while holding the bucket lock during insertion.
+    pub(super) unsafe fn mark_in_buckets(&self) {
+        self.inner.as_ref().mark_in_buckets()
+    }
+
+    /// Returns true if this timer is in the buckets (vs the wheel).
+    pub(super) fn is_in_buckets(&self) -> bool {
+        unsafe { self.inner.as_ref().is_in_buckets() }
     }
 
     /// Attempts to transition to a terminal state. If the state is already a
